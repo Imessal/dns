@@ -222,6 +222,12 @@ def ns_request(name, type, main_server = '8.8.8.8'):
     global ANSWER_LENGTH
     global KNOWN_NS
     try:
+        with open('saved', 'rb') as f:
+            load = pickle.load(f)
+            KNOWN_NS = load
+    except:
+        pass
+    try:
         value, ttl = KNOWN_NS[name][type]
         if time.time() - ttl > 300:
             pass
@@ -291,10 +297,14 @@ while True:
         conn, addr = s.accept()
     else:
         name, type = pickle.loads(data)
+        if (name, type) == ('shut', 'down'):
+            s.close()
+            with open('saved', 'wb') as f:
+                pickle.dump(KNOWN_NS, f)
+            break
+
         # line = line.replace("\n","")
         print('# Got', name, type)
         result = ns_request(name, type)
         print(result)
         conn.send(pickle.dumps(result))
-
-s.close()
