@@ -7,16 +7,7 @@ import time
 
 
 ANSWER_LENGTH = 0
-KNOWN_NS = {
-    'test' : {
-        'A' : ['1.1.1.1', '2.2.2.2'],
-        'NS' : ['a.b.com', 'c.d.com'],
-        'AAAA' : ['something', 'something']
-    },
-    '2.2.2.2' : {
-        'PTR' : 'privet.com'
-    }
-}
+KNOWN_NS = {}
 TYPE_VALUES = {
     'A' : '00 01',
     'NS' : '00 02',
@@ -106,8 +97,9 @@ def get_type(type):
 
 def parse_response(response, name):
     #global KNOWN_NS
-    result = []
+    addresses = []
     parsed = {}
+    ttl = 0
     parsed['id'] = response[0:4]
     params = response[4:8]
     params = str(format(int(params, 16), '0>42b'))
@@ -120,10 +112,29 @@ def parse_response(response, name):
     parsed['header'] = response[:ANSWER_LENGTH]
     gen = parse_answer(parsed['answer_section'], response)# parsed['header'])
     for value in gen:
-        #print(value['addr'])
-        #KNOWN_NS[name] = value['addr']
-        result.append(value['addr'])
+        addresses.append((value['addr'],
+                       get_type_by_value(value['type'])))
+        ttl = value['ttl']
+    result = (addresses, ttl)
     return result
+
+
+def merge_addresses(addresses):
+    new_dict = {}
+    for (value, key) in addresses:
+        if key in new_dict:
+            new_dict[key].append(value)
+        else:
+            new_dict[key] = [value]
+    return new_dict
+
+
+def get_type_by_value(value):
+    types = {'0001' : 'A',
+             '0002' : 'NS',
+             '0028' : 'AAAA',
+             '0012' : 'PTR'}
+    return types[value]
 
 
 def parse_answer(answer, response):
@@ -132,7 +143,7 @@ def parse_answer(answer, response):
         result['name'] = answer[0:4]
         result['type'] = answer[4:8]
         result['class'] = answer[8:12]
-        result['ttl'] = answer[16:20]
+        result['ttl'] = int(answer[16:20], 16)
         result['rdlength'] = answer[20:24]
 
         length = int(result['rdlength'],16)
@@ -218,21 +229,18 @@ def change_name_to_ptr(name):
     return name
 
 
-def ns_request(name, type, main_server = '8.8.8.8'):
+def ns_request(name, type, main_server = '8.8.8.8'): # 212.193.163.6
     global ANSWER_LENGTH
     global KNOWN_NS
     try:
-        with open('saved', 'rb') as f:
-            load = pickle.load(f)
-            KNOWN_NS = load
-    except:
-        pass
-    try:
-        value, ttl = KNOWN_NS[name][type]
-        if time.time() - ttl > 300:
+        value, rec_time = KNOWN_NS[name][type]
+        ttl = value[1]
+        print('TTL given by main server:', ttl)
+        print('Current storage time', time.time() - rec_time)
+        if time.time() - rec_time > ttl:
             pass
         else:
-            return value
+            return value[0]
     except KeyError:
         pass
     if type == 'PTR':
@@ -243,36 +251,36 @@ def ns_request(name, type, main_server = '8.8.8.8'):
                             '00 01')
     requesrt = header + ' ' + body
     ANSWER_LENGTH = len(requesrt.replace(' ', ''))
-    response = send_udp_message(requesrt, main_server, 53)  # 212.193.163.6
+    response = send_udp_message(requesrt, main_server, 53)
     try:
         result = parse_response(response, name)
     except ValueError as error:
-        result = [str(error)]
+        return [str(error)]
+
+    print(result)
+
+    addrs = result[0]
+    merged = merge_addresses(addrs)
+    safe_result = {}
+    for keys, values in merged.items():
+        safe_result[keys] = (set(values), result[1]) , time.time()
+
     if KNOWN_NS.get(name):
-        KNOWN_NS[name][type] = result, time.time()
+        for keys, values in safe_result.items():
+            KNOWN_NS[name][keys] = values
     else:
         KNOWN_NS[name] = {}
-        KNOWN_NS[name][type] = result, time.time()
-    return result
+        for keys, values in safe_result.items():
+            KNOWN_NS[name][keys] = values
+    return safe_result[type][0][0]
 
 
-# if __name__ == "__main__":
-#     ipsv4 = ns_request('amazon.com', 'A')
-#     ipsv6 = ns_request('test', 'AAAA')
-#     ns = ns_request('test', 'NS')
-#     ptr = ns_request('2.2.2.2', 'PTR')
-#
-#     print(ipsv4)
-#     print(ipsv6)
-#     print(ns)
-#     print(ptr)
 HOST = ''
 PORT = 7000
 
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 print('# Socket created')
 
-# Create socket on port
 try:
     s.bind((HOST, PORT))
 except socket.error as msg:
@@ -281,15 +289,20 @@ except socket.error as msg:
 
 print('# Socket bind complete')
 
-# Start listening on socket
 s.listen(10)
 print('# Socket now listening')
 
-# Wait for client
+try:
+    with open('saved.pickle', 'rb') as f:
+        load = pickle.load(f)
+        KNOWN_NS = load
+        print('NS loaded from disk:', KNOWN_NS)
+except:
+    pass
+
 conn, addr = s.accept()
 print('# Connected to ' + addr[0] + ':' + str(addr[1]))
 
-# Receive data from client
 while True:
     data = conn.recv(1024)
     if not data:
@@ -299,12 +312,14 @@ while True:
         name, type = pickle.loads(data)
         if (name, type) == ('shut', 'down'):
             s.close()
-            with open('saved', 'wb') as f:
+            with open('saved.pickle', 'wb') as f:
+                print('saving... ', KNOWN_NS)
                 pickle.dump(KNOWN_NS, f)
             break
 
         # line = line.replace("\n","")
         print('# Got', name, type)
+        print('# KNOWN NS:', KNOWN_NS)
         result = ns_request(name, type)
-        print(result)
+        print('# Result to send:', result)
         conn.send(pickle.dumps(result))
