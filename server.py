@@ -1,9 +1,13 @@
 import binascii
 import ipaddress
+import threading
 import socket
 import sys
 import pickle
 import time
+from collections import defaultdict
+
+from dnslib import *
 
 
 ANSWER_LENGTH = 0
@@ -96,7 +100,7 @@ def get_type(type):
 
 
 def parse_response(response, name):
-    #global KNOWN_NS
+    global KNOWN_NS
     addresses = []
     parsed = {}
     ttl = 0
@@ -110,30 +114,32 @@ def parse_response(response, name):
     parsed['params'] = params
     parsed['answer_section'] = response[ANSWER_LENGTH:]
     parsed['header'] = response[:ANSWER_LENGTH]
-    gen = parse_answer(parsed['answer_section'], response)# parsed['header'])
+    gen = parse_answer(parsed['answer_section'], response)
     for value in gen:
-        addresses.append((value['addr'],
-                       get_type_by_value(value['type'])))
+        addresses.append((value['name'], value['addr'],
+                          get_type_by_value(value['type'])))
         ttl = value['ttl']
     result = (addresses, ttl)
     return result
 
 
 def merge_addresses(addresses):
-    new_dict = {}
-    for (value, key) in addresses:
-        if key in new_dict:
-            new_dict[key].append(value)
-        else:
-            new_dict[key] = [value]
-    return new_dict
+    result_dict = defaultdict(dict)
+    for name, addr, type in addresses:
+        result_dict[name][type] = []
+    for name, addr, type in addresses:
+        if name in result_dict.keys():
+            if type in result_dict[name].keys():
+                result_dict[name][type].append(addr)
+    return result_dict
 
 
 def get_type_by_value(value):
     types = {'0001' : 'A',
              '0002' : 'NS',
              '0028' : 'AAAA',
-             '0012' : 'PTR'}
+             '001c' : 'AAAA',
+             '000c' : 'PTR'}
     return types[value]
 
 
@@ -170,6 +176,7 @@ def parse_answer(answer, response):
                 raise ValueError('Something bad happened. Probably no ipv6 address')
 
         result['addr'] = addr
+        result['name'] = parse_ns(result['name'], response)
         yield result
         answer = answer[24+length*2::]
 
@@ -229,18 +236,35 @@ def change_name_to_ptr(name):
     return name
 
 
-def ns_request(name, type, main_server = '8.8.8.8'): # 212.193.163.6
+def get_name_from_req(data):
+    type = data[-8:-4]
+    data = data[24:-10:]
+    parts = []
+    while data:
+        length = int(data[:2], 16)
+        parts.append(binascii.unhexlify(data[2:2 + length * 2]).decode())
+        data = data[2 + length * 2:]
+    name = '.'.join(parts)
+    print(name, type)
+    return name, type
+
+
+def ns_request(name, type, main_server='212.193.163.6'): # 212.193.163.6
     global ANSWER_LENGTH
     global KNOWN_NS
     try:
-        value, rec_time = KNOWN_NS[name][type]
-        ttl = value[1]
+        if type == 'AAAA':
+            return ['']
+        print(KNOWN_NS[name])
+        value, ttl, rec_time = KNOWN_NS[name]
+        # ttl = value[1]
         print('TTL given by main server:', ttl)
         print('Current storage time', time.time() - rec_time)
         if time.time() - rec_time > ttl:
             pass
         else:
-            return value[0]
+            print('RETURNED FROM KNOWN NS', value[type])
+            return value[type]
     except KeyError:
         pass
     if type == 'PTR':
@@ -257,28 +281,60 @@ def ns_request(name, type, main_server = '8.8.8.8'): # 212.193.163.6
     except ValueError as error:
         return [str(error)]
 
-    print(result)
-
-    addrs = result[0]
+    addrs, ttl = result
     merged = merge_addresses(addrs)
     safe_result = {}
-    for keys, values in merged.items():
-        safe_result[keys] = (set(values), result[1]) , time.time()
+    for el in merged.keys():
+        safe_result[el] = (merged[el], ttl, time.time())
 
-    if KNOWN_NS.get(name):
-        for keys, values in safe_result.items():
-            KNOWN_NS[name][keys] = values
-    else:
-        KNOWN_NS[name] = {}
-        for keys, values in safe_result.items():
-            KNOWN_NS[name][keys] = values
-    return safe_result[type][0][0]
+    for key, value in safe_result.items():
+        print(key, value)
+
+    for key, value in safe_result.items():
+        if KNOWN_NS.get(key):
+            KNOWN_NS[key] = safe_result[key]
+        else:
+            KNOWN_NS[key] = {}
+            KNOWN_NS[key] = safe_result[key]
+
+    print('KNOWN NS', KNOWN_NS)
+    return safe_result[name][0][type]
 
 
-HOST = ''
-PORT = 7000
+def make_nslib_a_response(id, name, addresses):
+    d = DNSRecord(DNSHeader(id=id, qr=1, aa=0, ra=1),
+                  q=DNSQuestion(name))
+    for addr in addresses:
+        d.add_answer(RR(name, ttl=200, rdata=A(addr)))
+    return binascii.hexlify(d.pack()).decode()
 
-s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+def make_nslib_ns_response(id, name, addresses):
+    d = DNSRecord(DNSHeader(id=id, qr=1, aa=0, ra=1),
+                  q=DNSQuestion(name))
+    for addr in addresses:
+        d.add_answer(RR(name, rtype=2, ttl=200, rdata=NS(addr)))
+    return binascii.hexlify(d.pack()).decode()
+
+
+def make_nslib_ptr_response(id, name, addresses):
+    d = DNSRecord(DNSHeader(id=id, qr=1, aa=0, ra=1),
+                  q=DNSQuestion(name))
+    for addr in addresses:
+        d.add_answer(RR(name, rtype=12, ttl=200, rdata=PTR(addr)))
+    return binascii.hexlify(d.pack()).decode()
+
+
+def save():
+    with open('saved.pickle', 'wb') as f:
+        print('saving... ', KNOWN_NS)
+        pickle.dump(KNOWN_NS, f)
+
+
+HOST = 'localhost'
+PORT = 53
+
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 print('# Socket created')
 
 try:
@@ -289,9 +345,6 @@ except socket.error as msg:
 
 print('# Socket bind complete')
 
-s.listen(10)
-print('# Socket now listening')
-
 try:
     with open('saved.pickle', 'rb') as f:
         load = pickle.load(f)
@@ -300,26 +353,43 @@ try:
 except:
     pass
 
-conn, addr = s.accept()
-print('# Connected to ' + addr[0] + ':' + str(addr[1]))
+
+save()
+
 
 while True:
-    data = conn.recv(1024)
-    if not data:
-        conn.close()
-        conn, addr = s.accept()
+    request, addr = s.recvfrom(1024)
+    if not request:
+        pass
     else:
-        name, type = pickle.loads(data)
-        if (name, type) == ('shut', 'down'):
-            s.close()
-            with open('saved.pickle', 'wb') as f:
-                print('saving... ', KNOWN_NS)
-                pickle.dump(KNOWN_NS, f)
-            break
+        print("# From", addr)
+        query = binascii.hexlify(request).decode()
+        print(query)
+        name, type = get_name_from_req(query)
+        if type == '001c':
+            s.sendto(''.encode(), addr)
+        type = get_type_by_value(type)
+        id = query[0:4]
+        print(name, type)
 
-        # line = line.replace("\n","")
+        time.sleep(1 - time.monotonic() % 1)
+        save()
+
         print('# Got', name, type)
         print('# KNOWN NS:', KNOWN_NS)
-        result = ns_request(name, type)
-        print('# Result to send:', result)
-        conn.send(pickle.dumps(result))
+        addresses = ns_request(name, type)
+        print('\n', addresses, '\n')
+        print('# Result to send:\n',
+              make_nslib_ns_response(int(id, 16), name, addresses))
+        try:
+            if type == 'A':
+                s.sendto(binascii.unhexlify(make_nslib_a_response(int(id, 16), name, addresses)), addr)
+            elif type == 'NS':
+                s.sendto(binascii.unhexlify(make_nslib_ns_response(int(id, 16), name, addresses)), addr)
+            elif type == 'PTR':
+                s.sendto(binascii.unhexlify(make_nslib_ptr_response(int(id, 16), name, addresses)), addr)
+            else:
+                pass
+        except ValueError:
+            pass
+
